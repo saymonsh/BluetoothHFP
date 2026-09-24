@@ -68,7 +68,9 @@ try {
         & $helper list $instance $originalInf 'ibtusb'
         if ($LASTEXITCODE) { throw 'Original driver recovery candidate missing' }
         & $helper install $instance (Join-Path $env:windir 'INF\winusb.inf') 'WINUSB'
-        if ($LASTEXITCODE -eq 3010) { throw 'Windows requires a reboot; automatic reboot is disabled' }
+        if ($LASTEXITCODE -eq 3010) {
+            throw 'Windows could not release the Bluetooth adapter live (something holds it open). Usually a Bluetooth headset/speaker paired with Windows: remove it in Settings > Bluetooth & devices and try again.'
+        }
         if ($LASTEXITCODE) { throw 'WinUSB binding failed' }
     } else {
         Restore-Intel

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <newdev.h>
+#include <cfgmgr32.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -11,7 +12,29 @@ static int fail(const char* operation) {
     std::cerr << "[DRIVER] " << operation << " failed win32=" << GetLastError() << '\n';
     return 1;
 }
+// Diagnostic: ask Plug and Play whether the adapter can be removed right now, and if not,
+// which device or driver vetoes it. If nothing vetoes, the device is removed and immediately
+// re-enumerated, so Windows re-binds its normal (Intel) driver.
+static int veto(const std::wstring& instance) {
+    DEVINST node = 0, root = 0;
+    if (CM_Locate_DevNodeW(&node, const_cast<wchar_t*>(instance.c_str()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) return fail("Locate device");
+    PNP_VETO_TYPE type = PNP_VetoTypeUnknown;
+    wchar_t name[MAX_PATH] = {};
+    const CONFIGRET result = CM_Query_And_Remove_SubTreeW(node, &type, name, MAX_PATH, CM_REMOVE_NO_RESTART);
+    std::wcout << L"[VETO] result=" << result << L" vetoType=" << type << L" vetoName=" << name << L'\n';
+    if (result == CR_SUCCESS && CM_Locate_DevNodeW(&root, nullptr, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+        CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS);
+        std::wcout << L"[VETO] Not vetoed; device removed and re-enumerated\n";
+    }
+    return result == CR_SUCCESS ? 0 : 5;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 3 && std::wstring(argv[1]) == L"veto") {
+        const std::wstring instance = argv[2];
+        if (instance.find(L"USB\\VID_8087&PID_0026\\") != 0) return 64;
+        return veto(instance);
+    }
     if (argc != 5 || (std::wstring(argv[1]) != L"list" && std::wstring(argv[1]) != L"install")) {
         std::cerr << "Usage: ax201_driver list|install <exact-instance> <preinstalled-INF> <section>\n";
         return 64;

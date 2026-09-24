@@ -25,14 +25,17 @@ if ($InstanceId -notlike 'USB\VID_8087&PID_0026\*') { Note "No valid AX201 insta
 function Service() {
     try { return (Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName DEVPKEY_Device_Service -ErrorAction Stop).Data } catch { return $null }
 }
+function Healthy() {
+    try { return (Service) -eq 'BTHUSB' -and (Get-PnpDevice -InstanceId $InstanceId -ErrorAction Stop).Status -eq 'OK' } catch { return $false }
+}
 $before = Service
-if ($before -eq 'BTHUSB') { Note "Bluetooth already on the Windows driver"; exit 0 }
+if (Healthy) { Note "Bluetooth already working on the Windows driver"; exit 0 }
 Note "Bluetooth driver is '$before'; restoring the Windows driver"
 & pnputil.exe /remove-device "$InstanceId" | Out-Null
 & pnputil.exe /scan-devices | Out-Null
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
-    if ((Service) -eq 'BTHUSB') { Note "Restored: Windows Bluetooth driver active"; exit 0 }
+    if (Healthy) { Note "Restored: Windows Bluetooth driver active"; exit 0 }
 }
 Note "Restore did not complete (driver now '$(Service)'). Restart Windows; if Bluetooth is still missing, Device Manager > Uninstall device > Scan for hardware changes."
 exit 1
