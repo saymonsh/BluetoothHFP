@@ -225,6 +225,9 @@ static void mirror_call_state(const char * name, int status) {
         if (status == 1) {
             if (ag_ringing) { ag_ringing = 0; ag_call = 1; ag_self = 1; hfp_ag_answer_incoming_call(); ag_self = 0; }
             say("[CALL] Call active\n");
+            // Some phones keep the audio on the handset: ask for it explicitly.
+            if (phone_sco == HCI_CON_HANDLE_INVALID && phone_acl != HCI_CON_HANDLE_INVALID)
+                say("[PHONE] Requesting call audio: 0x%02x\n", hfp_hf_establish_audio_connection(phone_acl));
         } else {
             ag_end_call();
             say("[CALL] Call ended\n");
@@ -272,7 +275,9 @@ static void phone_event(uint8_t type, uint16_t channel, uint8_t * event, uint16_
             btstack_cvsd_plc_init(&plc[LINK_PHONE]);
             pcm_fifo_reset(&to_headset); pcm_fifo_reset(&to_phone);
             sco_packets[LINK_PHONE] = sco_dropped[LINK_PHONE] = 0;
-            say("[PHONE] Call audio connected (codec %u)\n", hfp_subevent_audio_connection_established_get_negotiated_codec(event));
+            say("[PHONE] Call audio connected (codec %u, packet types 0x%04x)\n",
+                hfp_subevent_audio_connection_established_get_negotiated_codec(event),
+                hfp_subevent_audio_connection_established_get_sco_packet_types(event));
             if (headset_acl != HCI_CON_HANDLE_INVALID) {
                 if (headset_sco == HCI_CON_HANDLE_INVALID) hfp_ag_establish_audio_connection(headset_acl);
             } else speaker_fallback_set(1);
@@ -336,7 +341,7 @@ static void headset_event(uint8_t type, uint16_t channel, uint8_t * event, uint1
             pcm_fifo_reset(&to_headset); pcm_fifo_reset(&to_phone);
             sco_packets[LINK_HEADSET] = sco_dropped[LINK_HEADSET] = 0;
             speaker_fallback_set(0);
-            say("[HEADSET] Audio connected\n");
+            say("[HEADSET] Audio connected (packet types 0x%04x)\n", hfp_subevent_audio_connection_established_get_sco_packet_types(event));
             break;
         case HFP_SUBEVENT_AUDIO_CONNECTION_RELEASED:
             headset_sco = HCI_CON_HANDLE_INVALID;
@@ -362,6 +367,17 @@ static struct { bd_addr_t addr; char name[64]; } candidates[MAX_CANDIDATES];
 static int candidate_count, searching, choosing;
 
 static void gap_event(uint8_t type, uint16_t channel, uint8_t * packet, uint16_t size);
+
+static bd_addr_t new_phone;
+static int have_new_phone;
+static btstack_timer_source_t new_phone_timer;
+static void connect_new_phone(btstack_timer_source_t * ts) {
+    (void)ts;
+    if (!have_new_phone || !pairing_open || phone_acl != HCI_CON_HANDLE_INVALID) return;
+    const uint8_t status = hfp_hf_establish_service_level_connection(new_phone);
+    say("[PHONE] Connecting hands-free to %s (status 0x%02x)\n", bd_addr_to_str(new_phone), status);
+    if (status == ERROR_CODE_SUCCESS) phone_connecting = 1;
+}
 
 static void connect_known(void) {
     if (have_phone && phone_acl == HCI_CON_HANDLE_INVALID && !phone_connecting) {
@@ -437,6 +453,11 @@ static void key(char c) {
             say("[HEADSET] Put the headset in pairing mode now. Searching for 10 s...\n");
             break;
         case 'c': connect_known(); say("[APP] Reconnecting saved devices\n"); break;
+        case 'a': // test: open/close headset audio without a phone call
+            if (headset_acl == HCI_CON_HANDLE_INVALID) { say("[HEADSET] Not connected\n"); break; }
+            if (headset_sco == HCI_CON_HANDLE_INVALID) say("[HEADSET] Audio test open: 0x%02x\n", hfp_ag_establish_audio_connection(headset_acl));
+            else say("[HEADSET] Audio test close: 0x%02x\n", hfp_ag_release_audio_connection(headset_acl));
+            break;
         case 's': print_status(); break;
         case 'q': begin_shutdown(); break;
         default:
@@ -514,6 +535,31 @@ static void gap_event(uint8_t type, uint16_t channel, uint8_t * packet, uint16_t
             break;
         case HCI_EVENT_SIMPLE_PAIRING_COMPLETE:
             say("[SEC] Pairing finished (status 0x%02x)\n", hci_event_simple_pairing_complete_get_status(packet));
+            hci_event_simple_pairing_complete_get_bd_addr(packet, addr);
+            // A new phone paired in the window: open the hands-free link ourselves (many basic
+            // phones pair but never connect to the hands-free service on their own).
+            if (!hci_event_simple_pairing_complete_get_status(packet) && pairing_open && !known(addr) &&
+                phone_acl == HCI_CON_HANDLE_INVALID) {
+                bd_addr_copy(new_phone, addr); have_new_phone = 1;
+                btstack_run_loop_remove_timer(&new_phone_timer);
+                btstack_run_loop_set_timer_handler(&new_phone_timer, connect_new_phone);
+                btstack_run_loop_set_timer(&new_phone_timer, 1500); // let the phone finish its side first
+                btstack_run_loop_add_timer(&new_phone_timer);
+            }
+            break;
+        case HCI_EVENT_CONNECTION_COMPLETE:
+            hci_event_connection_complete_get_bd_addr(packet, addr);
+            say("[BT] Link %s status 0x%02x\n", bd_addr_to_str(addr), hci_event_connection_complete_get_status(packet));
+            if (!hci_event_connection_complete_get_status(packet)) gap_request_role(addr, HCI_ROLE_MASTER);
+            break;
+        case HCI_EVENT_ROLE_CHANGE:
+            hci_event_role_change_get_bd_addr(packet, addr);
+            say("[BT] Role with %s: %s (status 0x%02x)\n", bd_addr_to_str(addr),
+                hci_event_role_change_get_role(packet) == HCI_ROLE_MASTER ? "PC is central" : "PC is peripheral",
+                hci_event_role_change_get_status(packet));
+            break;
+        case HCI_EVENT_DISCONNECTION_COMPLETE:
+            say("[BT] Link closed (reason 0x%02x)\n", hci_event_disconnection_complete_get_reason(packet));
             break;
         default: break;
     }
@@ -593,6 +639,11 @@ int main(void) {
     hfp_ag_create_sdp_record_with_codecs(ag_record, sdp_create_service_record_handle(), AG_CHANNEL,
         "Q7 Bridge Audio Gateway", 1, ag_features, 1, codecs);
 
+    // Two calls' worth of audio (phone + headset) must share the radio: forbid HV1/HV2, which
+    // occupy every/every-other slot, so each link uses HV3 or eSCO (a third of the airtime or less).
+    // Without this the phone link took HV1 and the controller refused the headset link (0x0A).
+    hfp_set_sco_packet_types(SCO_PACKET_TYPES_ALL & ~(SCO_PACKET_TYPES_HV1 | SCO_PACKET_TYPES_HV2));
+
     if (de_get_len(hf_record) > sizeof(hf_record) || de_get_len(ag_record) > sizeof(ag_record) ||
         sdp_register_service(hf_record) != ERROR_CODE_SUCCESS || sdp_register_service(ag_record) != ERROR_CODE_SUCCESS) {
         say("[SDP] Service registration failed\n");
@@ -607,7 +658,10 @@ int main(void) {
     gap_connectable_control(1);
     gap_register_classic_connection_filter(connection_filter);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    gap_set_allow_role_switch(true);
+    // Keep the PC central (master) on BOTH links, so phone and headset audio share one piconet.
+    // In a scatternet the AX201 refused the second audio link (HCI error 0x0A).
+    gap_set_allow_role_switch(false);   // outgoing: don't let the remote take over
+    hci_set_master_slave_policy(0);     // incoming: ask to become central when accepting
 
     static btstack_packet_callback_registration_t gap_registration;
     gap_registration.callback = gap_event;
