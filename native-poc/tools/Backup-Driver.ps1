@@ -11,7 +11,8 @@ function PropertyValue([string]$Name) {
 }
 $inf = PropertyValue 'DEVPKEY_Device_DriverInfPath'
 if ($inf -notmatch '^oem\d+\.inf$') { throw "Expected an exportable OEM INF, got: $inf" }
-$destination = Join-Path ([IO.Path]::GetFullPath($OutputDirectory)) (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+$outputRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory) # relative to $PWD
+$destination = Join-Path $outputRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
 New-Item -ItemType Directory -Path $destination | Out-Null
 $package = New-Item -ItemType Directory -Path (Join-Path $destination 'driver-package')
 $net = @(Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,InterfaceGuid)

@@ -12,7 +12,7 @@ WasapiEndpoint::WasapiEndpoint(bool capture, unsigned rate, unsigned channels) {
     wchar_t selected[1024] = {};
     const DWORD length = GetEnvironmentVariableW(capture ? L"AX201_CAPTURE" : L"AX201_RENDER", selected, 1024);
     if (length && length < 1024) check_audio(enumerator->GetDevice(selected, &device), "Get selected endpoint");
-    else check_audio(enumerator->GetDefaultAudioEndpoint(capture ? eCapture : eRender, eConsole, &device), "Get default endpoint");
+    else check_audio(enumerator->GetDefaultAudioEndpoint(capture ? eCapture : eRender, eCommunications, &device), "Get default endpoint");
     ComPtr<IPropertyStore> properties;
     if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &properties))) {
         PROPVARIANT name; PropVariantInit(&name);

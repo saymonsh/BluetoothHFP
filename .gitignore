@@ -50,3 +50,4 @@ app.*.map.json
 HFP-EXPERIMENT.md
 /.local/ax201-backup/
 /.local/hfp-run/
+/.local/
