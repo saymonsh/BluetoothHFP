@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(q7_bridge LANGUAGES C CXX)
-if(NOT BTSTACK_ROOT OR NOT PATCHED_TRANSPORT)
+if(NOT BTSTACK_ROOT OR NOT PATCHED_TRANSPORT OR NOT PATCHED_HCI)
   message(FATAL_ERROR "Configure through native-poc/tools/Build-Q7.ps1 (needs BTSTACK_ROOT and PATCHED_TRANSPORT)")
 endif()
 set(R ${BTSTACK_ROOT})
@@ -9,7 +9,7 @@ set(R ${BTSTACK_ROOT})
 add_library(btstack_min STATIC
   ${R}/src/btstack_linked_list.c ${R}/src/btstack_memory.c ${R}/src/btstack_memory_pool.c
   ${R}/src/btstack_run_loop.c ${R}/src/btstack_util.c ${R}/src/btstack_tlv.c ${R}/src/ad_parser.c
-  ${R}/src/hci.c ${R}/src/hci_cmd.c ${R}/src/hci_dump.c ${R}/src/l2cap.c ${R}/src/l2cap_signaling.c
+  ${PATCHED_HCI} ${R}/src/hci_cmd.c ${R}/src/hci_dump.c ${R}/src/l2cap.c ${R}/src/l2cap_signaling.c
   ${R}/src/classic/rfcomm.c ${R}/src/classic/sdp_server.c ${R}/src/classic/sdp_client.c
   ${R}/src/classic/sdp_client_rfcomm.c ${R}/src/classic/sdp_util.c
   ${R}/src/classic/hfp.c ${R}/src/classic/hfp_ag.c ${R}/src/classic/hfp_hf.c ${R}/src/classic/hfp_gsm_model.c

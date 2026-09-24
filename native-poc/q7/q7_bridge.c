@@ -91,7 +91,13 @@ static int known(const bd_addr_t addr) {
            (have_headset && bd_addr_cmp(addr, headset_addr) == 0) ||
            (have_pending && bd_addr_cmp(addr, pending_headset) == 0);
 }
+// Who may connect at all (connection filter).
 static int allowed(const bd_addr_t addr) { return pairing_open || known(addr); }
+// Who may (re-)pair. Saved devices must authenticate with their stored link key;
+// if a saved device lost its key, the user re-pairs it through 'p' or 'h'.
+static int pairing_allowed(const bd_addr_t addr) {
+    return pairing_open || (have_pending && bd_addr_cmp(addr, pending_headset) == 0);
+}
 
 static int connection_filter(bd_addr_t addr, hci_link_type_t link_type) {
     (void)link_type;
@@ -118,7 +124,11 @@ static void pairing_start(void) {
     btstack_run_loop_set_timer_handler(&pairing_timer, pairing_close);
     btstack_run_loop_set_timer(&pairing_timer, PAIRING_WINDOW_MS);
     btstack_run_loop_add_timer(&pairing_timer);
-    say("[SEC] Pairing open for 120 s. On the Q7: Bluetooth > search > \"Q7 Bridge\" > pair.\n");
+    say("[SEC] Pairing open for 120 s (phone only). On the Q7: Bluetooth > search > \"Q7 Bridge\" > pair.\n");
+}
+// Printable copy of an untrusted remote name (no control or escape characters).
+static void sanitize(char * text) {
+    for (; *text; ++text) if ((unsigned char)*text < 0x20 || *text == 0x7f) *text = '?';
 }
 
 // ---- connection state ----------------------------------------------------------
@@ -179,7 +189,9 @@ static void sco_packet(uint8_t type, uint16_t channel, uint8_t * packet, uint16_
         else if (speaker_fallback) audio_render_write(audio, count);
         // Reply to the phone with the same amount of the user's voice (paces TX by RX).
         if (headset_sco != HCI_CON_HANDLE_INVALID) pcm_fifo_pull(&to_phone, reply, count);
-        else if (speaker_fallback) { audio_capture_read(reply, count); tap_push(1, reply, count); }
+        else if (speaker_fallback && (phone_call || phone_callsetup)) { // PC mic only during a real call
+            audio_capture_read(reply, count); tap_push(1, reply, count);
+        }
         else memset(reply, 0, count * sizeof(int16_t));
         send_sco(LINK_PHONE, reply, count);
     } else {
@@ -191,21 +203,30 @@ static void sco_packet(uint8_t type, uint16_t channel, uint8_t * packet, uint16_
 }
 
 // ---- phone side (we are the hands-free unit) ----------------------------------------
+// BTstack delivers AG events synchronously, so ag_self marks events we caused ourselves
+// (otherwise ending the call on the headset side would echo back and hang up the phone).
+static int ag_self;
+static void ag_end_call(void) {
+    ag_self = 1;
+    if (ag_ringing) hfp_ag_call_dropped(); else if (ag_call) hfp_ag_terminate_call();
+    ag_self = 0;
+    ag_ringing = ag_call = 0;
+}
 static void mirror_call_state(const char * name, int status) {
     if (strcmp(name, "callsetup") == 0) {
         phone_callsetup = status;
         if (status == 1 && headset_acl != HCI_CON_HANDLE_INVALID && !ag_ringing && !ag_call) {
             ag_ringing = 1; hfp_ag_incoming_call(); say("[CALL] Incoming call: headset rings\n");
         } else if (status == 0 && ag_ringing && !phone_call) {
-            ag_ringing = 0; hfp_ag_call_dropped(); say("[CALL] Call not answered\n");
+            ag_end_call(); say("[CALL] Call not answered\n");
         }
     } else if (strcmp(name, "call") == 0) {
         phone_call = status;
         if (status == 1) {
-            if (ag_ringing) { ag_ringing = 0; ag_call = 1; hfp_ag_answer_incoming_call(); }
+            if (ag_ringing) { ag_ringing = 0; ag_call = 1; ag_self = 1; hfp_ag_answer_incoming_call(); ag_self = 0; }
             say("[CALL] Call active\n");
         } else {
-            if (ag_call) { ag_call = 0; hfp_ag_terminate_call(); }
+            ag_end_call();
             say("[CALL] Call ended\n");
         }
     }
@@ -222,17 +243,26 @@ static void phone_event(uint8_t type, uint16_t channel, uint8_t * event, uint16_
             status = hfp_subevent_service_level_connection_established_get_status(event);
             hfp_subevent_service_level_connection_established_get_bd_addr(event, addr);
             if (status) { say("[PHONE] Connection to %s failed (0x%02x)\n", bd_addr_to_str(addr), status); break; }
+            if (!(have_phone && bd_addr_cmp(addr, phone_addr) == 0)) {
+                // A new phone is accepted only through the explicit pairing window ('p').
+                if (!pairing_open) {
+                    say("[SEC] Refused phone role for %s\n", bd_addr_to_str(addr));
+                    hfp_hf_release_service_level_connection(hfp_subevent_service_level_connection_established_get_acl_handle(event));
+                    break;
+                }
+                bd_addr_copy(phone_addr, addr); have_phone = 1; devices_save();
+                pairing_close(NULL); // one enrollment per window
+            }
             phone_acl = hfp_subevent_service_level_connection_established_get_acl_handle(event);
-            if (!have_phone || bd_addr_cmp(addr, phone_addr) != 0) { bd_addr_copy(phone_addr, addr); have_phone = 1; devices_save(); }
             say("[PHONE] Connected: %s\n", bd_addr_to_str(addr));
             break;
         case HFP_SUBEVENT_SERVICE_LEVEL_CONNECTION_RELEASED:
+            if (hfp_subevent_service_level_connection_released_get_acl_handle(event) != phone_acl) break;
             phone_acl = HCI_CON_HANDLE_INVALID; phone_sco = HCI_CON_HANDLE_INVALID;
             phone_call = phone_callsetup = 0;
             speaker_fallback_set(0);
-            if (ag_ringing) { ag_ringing = 0; hfp_ag_call_dropped(); }
-            if (ag_call) { ag_call = 0; hfp_ag_terminate_call(); }
-            if (headset_sco != HCI_CON_HANDLE_INVALID) hfp_ag_release_audio_connection(headset_acl);
+            ag_end_call();
+            if (headset_acl != HCI_CON_HANDLE_INVALID) hfp_ag_release_audio_connection(headset_acl);
             say("[PHONE] Disconnected\n");
             break;
         case HFP_SUBEVENT_AUDIO_CONNECTION_ESTABLISHED:
@@ -250,7 +280,8 @@ static void phone_event(uint8_t type, uint16_t channel, uint8_t * event, uint16_
         case HFP_SUBEVENT_AUDIO_CONNECTION_RELEASED:
             phone_sco = HCI_CON_HANDLE_INVALID;
             speaker_fallback_set(0);
-            if (headset_sco != HCI_CON_HANDLE_INVALID) hfp_ag_release_audio_connection(headset_acl);
+            // Also cancels a headset audio setup that is still in progress.
+            if (headset_acl != HCI_CON_HANDLE_INVALID) hfp_ag_release_audio_connection(headset_acl);
             say("[PHONE] Call audio released (dropped TX packets: %u)\n", sco_dropped[LINK_PHONE]);
             break;
         case HFP_SUBEVENT_AG_INDICATOR_STATUS_CHANGED:
@@ -272,14 +303,22 @@ static void headset_event(uint8_t type, uint16_t channel, uint8_t * event, uint1
             headset_connecting = 0;
             status = hfp_subevent_service_level_connection_established_get_status(event);
             hfp_subevent_service_level_connection_established_get_bd_addr(event, addr);
-            if (have_pending && bd_addr_cmp(addr, pending_headset) == 0) { have_pending = 0; update_bondable(); }
+            const int was_pending = have_pending && bd_addr_cmp(addr, pending_headset) == 0;
+            if (was_pending) { have_pending = 0; update_bondable(); }
             if (status) { say("[HEADSET] Connection to %s failed (0x%02x)\n", bd_addr_to_str(addr), status); break; }
+            if (!was_pending && !(have_headset && bd_addr_cmp(addr, headset_addr) == 0)) {
+                // Only the headset the user picked with 'h' (or the saved one) gets the gateway role.
+                say("[SEC] Refused headset role for %s\n", bd_addr_to_str(addr));
+                hfp_ag_release_service_level_connection(hfp_subevent_service_level_connection_established_get_acl_handle(event));
+                break;
+            }
             headset_acl = hfp_subevent_service_level_connection_established_get_acl_handle(event);
-            if (!have_headset || bd_addr_cmp(addr, headset_addr) != 0) { bd_addr_copy(headset_addr, addr); have_headset = 1; devices_save(); }
+            if (was_pending) { bd_addr_copy(headset_addr, addr); have_headset = 1; devices_save(); }
             say("[HEADSET] Connected: %s\n", bd_addr_to_str(addr));
             if (phone_sco != HCI_CON_HANDLE_INVALID) hfp_ag_establish_audio_connection(headset_acl);
             break;
         case HFP_SUBEVENT_SERVICE_LEVEL_CONNECTION_RELEASED:
+            if (hfp_subevent_service_level_connection_released_get_acl_handle(event) != headset_acl) break;
             headset_acl = HCI_CON_HANDLE_INVALID; headset_sco = HCI_CON_HANDLE_INVALID;
             ag_ringing = ag_call = 0;
             if (phone_sco != HCI_CON_HANDLE_INVALID) speaker_fallback_set(1);
@@ -309,6 +348,7 @@ static void headset_event(uint8_t type, uint16_t channel, uint8_t * event, uint1
             if (phone_callsetup == 1 && !phone_call && phone_acl != HCI_CON_HANDLE_INVALID) hfp_hf_answer_incoming_call(phone_acl);
             break;
         case HFP_SUBEVENT_CALL_TERMINATED: // headset button during a call
+            if (ag_self) break; // we ended it ourselves because the phone call ended
             ag_ringing = ag_call = 0;
             if ((phone_call || phone_callsetup) && phone_acl != HCI_CON_HANDLE_INVALID) hfp_hf_terminate_call(phone_acl);
             break;
@@ -317,8 +357,9 @@ static void headset_event(uint8_t type, uint16_t channel, uint8_t * event, uint1
 }
 
 // ---- GAP / pairing -------------------------------------------------------------------
-static bd_addr_t candidate;
-static int have_candidate, searching;
+#define MAX_CANDIDATES 9
+static struct { bd_addr_t addr; char name[64]; } candidates[MAX_CANDIDATES];
+static int candidate_count, searching, choosing;
 
 static void gap_event(uint8_t type, uint16_t channel, uint8_t * packet, uint16_t size);
 
@@ -373,15 +414,27 @@ static void print_status(void) {
         phone_sco != HCI_CON_HANDLE_INVALID ? "on" : "off", headset_sco != HCI_CON_HANDLE_INVALID ? "on" : "off", speaker_fallback);
 }
 
+static void choose_headset(int index) {
+    choosing = 0;
+    bd_addr_copy(pending_headset, candidates[index].addr); have_pending = 1; update_bondable();
+    say("[HEADSET] Connecting to %s (%s)...\n", candidates[index].name, bd_addr_to_str(pending_headset));
+    if (hfp_ag_establish_service_level_connection(pending_headset) != ERROR_CODE_SUCCESS) {
+        have_pending = 0; update_bondable(); say("[HEADSET] Could not start the connection\n");
+    } else headset_connecting = 1;
+}
+
 static void key(char c) {
     if (stopping) return;
+    if (choosing && c >= '1' && c < '1' + candidate_count) { choose_headset(c - '1'); return; }
     switch (c) {
-        case 'p': pairing_start(); break;
+        case 'p': if (working) pairing_start(); break;
         case 'h':
             if (searching) break;
-            searching = 1; have_candidate = 0;
+            if (!working) { say("[HEADSET] Bluetooth is still starting; try again in a moment\n"); break; }
+            candidate_count = 0; choosing = 0;
+            if (gap_inquiry_start(8) != 0) { say("[HEADSET] Could not start searching; press h again\n"); break; }
+            searching = 1;
             say("[HEADSET] Put the headset in pairing mode now. Searching for 10 s...\n");
-            gap_inquiry_start(8);
             break;
         case 'c': connect_known(); say("[APP] Reconnecting saved devices\n"); break;
         case 's': print_status(); break;
@@ -422,35 +475,41 @@ static void gap_event(uint8_t type, uint16_t channel, uint8_t * packet, uint16_t
         case GAP_EVENT_INQUIRY_RESULT: {
             gap_event_inquiry_result_get_bd_addr(packet, addr);
             const uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
-            const int audio_device = ((cod >> 8) & 0x1f) == 0x04; // major class Audio/Video
-            char name[64] = "";
+            // Headset-like: major class Audio/Video with minor Wearable Headset, Hands-free or Headphones.
+            const unsigned minor = (cod >> 2) & 0x3f;
+            const int headset_like = ((cod >> 8) & 0x1f) == 0x04 && (minor == 0x01 || minor == 0x02 || minor == 0x06);
+            if (!searching || !headset_like || (have_phone && bd_addr_cmp(addr, phone_addr) == 0)) break;
+            int seen = 0;
+            for (int i = 0; i < candidate_count; ++i) if (bd_addr_cmp(candidates[i].addr, addr) == 0) seen = 1;
+            if (seen || candidate_count == MAX_CANDIDATES) break;
+            bd_addr_copy(candidates[candidate_count].addr, addr);
+            strcpy_s(candidates[candidate_count].name, sizeof(candidates[candidate_count].name), "(no name)");
             if (gap_event_inquiry_result_get_name_available(packet)) {
                 const int len = gap_event_inquiry_result_get_name_len(packet) < 63 ? gap_event_inquiry_result_get_name_len(packet) : 63;
-                memcpy(name, gap_event_inquiry_result_get_name(packet), len); name[len] = 0;
+                memcpy(candidates[candidate_count].name, gap_event_inquiry_result_get_name(packet), len);
+                candidates[candidate_count].name[len] = 0;
+                sanitize(candidates[candidate_count].name);
             }
-            say("[SCAN] %s %s%s\n", bd_addr_to_str(addr), name, audio_device ? " (audio)" : "");
-            if (audio_device && !have_candidate && !(have_phone && bd_addr_cmp(addr, phone_addr) == 0)) {
-                bd_addr_copy(candidate, addr); have_candidate = 1;
-            }
+            candidate_count++;
             break;
         }
         case GAP_EVENT_INQUIRY_COMPLETE:
+            if (!searching) break;
             searching = 0;
-            if (!have_candidate) { say("[HEADSET] No headset in pairing mode was found. Press h to try again.\n"); break; }
-            bd_addr_copy(pending_headset, candidate); have_pending = 1; update_bondable();
-            say("[HEADSET] Connecting to %s...\n", bd_addr_to_str(candidate));
-            if (hfp_ag_establish_service_level_connection(candidate) != ERROR_CODE_SUCCESS) {
-                have_pending = 0; update_bondable(); say("[HEADSET] Could not start the connection\n");
-            } else headset_connecting = 1;
+            if (!candidate_count) { say("[HEADSET] No headset in pairing mode was found. Press h to try again.\n"); break; }
+            say("[HEADSET] Found:\n");
+            for (int i = 0; i < candidate_count; ++i) say("   %d: %s (%s)\n", i + 1, candidates[i].name, bd_addr_to_str(candidates[i].addr));
+            say("[HEADSET] Press the number of YOUR headset (nothing is connected until you choose)\n");
+            choosing = 1;
             break;
         case HCI_EVENT_USER_CONFIRMATION_REQUEST:
             hci_event_user_confirmation_request_get_bd_addr(packet, addr);
-            if (allowed(addr)) gap_ssp_confirmation_response(addr);
+            if (pairing_allowed(addr)) gap_ssp_confirmation_response(addr);
             else { gap_ssp_confirmation_negative(addr); say("[SEC] Refused pairing from %s\n", bd_addr_to_str(addr)); }
             break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             hci_event_pin_code_request_get_bd_addr(packet, addr);
-            if (allowed(addr)) gap_pin_code_response(addr, "0000");
+            if (pairing_allowed(addr)) gap_pin_code_response(addr, "0000");
             else { gap_pin_code_negative(addr); say("[SEC] Refused PIN pairing from %s\n", bd_addr_to_str(addr)); }
             break;
         case HCI_EVENT_SIMPLE_PAIRING_COMPLETE:

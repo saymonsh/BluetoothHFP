@@ -53,6 +53,16 @@ $transport = Replace-Once $transport 'if (!usb_device_handle) goto exit_on_error
 $patched = Join-Path $build 'hci_transport_h2_winusb.c'
 [IO.File]::WriteAllText($patched, $transport)
 
+# Patch hci.c: when one of two SCO links closes, upstream reads the just-freed connection
+# instead of the remaining one, so the remaining call audio gets the wrong USB setting.
+$hci = Get-Content (Join-Path $source 'src\hci.c') -Raw
+$pattern = '(if \(other_conn == connection\) continue;\s+)if \(connection->address_type != BD_ADDR_TYPE_SCO\) continue;(\s+)int multiplier = hci_sco_get_multiplier_for_voice_setting\(connection->sco_voice_setting\);'
+$found = [regex]::Matches($hci, $pattern)
+if ($found.Count -ne 1) { throw "hci.c patch anchor found $($found.Count) times" }
+$hci = [regex]::Replace($hci, $pattern, '${1}if (other_conn->address_type != BD_ADDR_TYPE_SCO) continue;${2}int multiplier = hci_sco_get_multiplier_for_voice_setting(other_conn->sco_voice_setting);')
+$patchedHci = Join-Path $build 'hci.c'
+[IO.File]::WriteAllText($patchedHci, $hci)
+
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vs = & $vswhere -version '[17.0,18.0)' -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw 'Visual Studio 2022 C++ build tools are required' }
@@ -69,5 +79,5 @@ function Build([string]$sourceDir, [string]$buildDir, [string[]]$extra) {
     if ($LASTEXITCODE) { throw "Tests failed: $sourceDir" }
 }
 Build (Join-Path $repo 'native-poc') (Join-Path $repo 'build\ax201-poc') @()
-Build (Join-Path $repo 'native-poc\q7') $build @("-DBTSTACK_ROOT=$($source.Replace('\','/'))", "-DPATCHED_TRANSPORT=$($patched.Replace('\','/'))")
+Build (Join-Path $repo 'native-poc\q7') $build @("-DBTSTACK_ROOT=$($source.Replace('\','/'))", "-DPATCHED_TRANSPORT=$($patched.Replace('\','/'))", "-DPATCHED_HCI=$($patchedHci.Replace('\','/'))")
 Write-Output "[BUILD] $build\Release\q7_bridge.exe"

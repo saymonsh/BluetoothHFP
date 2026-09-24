@@ -34,7 +34,8 @@ bool user_only_security(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& sd) {
     if (!ok) return false;
     LPWSTR sid = nullptr;
     if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &sid)) return false;
-    std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sid) + L")";
+    // Owner-only DACL plus an explicit Medium integrity label with no-read-up/no-write-up.
+    std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sid) + L")S:(ML;;NWNR;;;ME)";
     LocalFree(sid);
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) return false;
     sa = {sizeof(sa), sd, FALSE};
@@ -47,7 +48,11 @@ bool write_all(HANDLE pipe, HANDLE io_event, const void* data, DWORD size) {
     if (!WriteFile(pipe, data, size, &written, &ov)) {
         if (GetLastError() != ERROR_IO_PENDING) return false;
         HANDLE waits[] = {stop_event, io_event};
-        if (WaitForMultipleObjects(2, waits, FALSE, 1000) != WAIT_OBJECT_0 + 1) { CancelIo(pipe); return false; }
+        if (WaitForMultipleObjects(2, waits, FALSE, 1000) != WAIT_OBJECT_0 + 1) {
+            CancelIo(pipe);
+            GetOverlappedResult(pipe, &ov, &written, TRUE); // the OVERLAPPED lives on this stack frame
+            return false;
+        }
         if (!GetOverlappedResult(pipe, &ov, &written, FALSE)) return false;
     }
     return written == size;
@@ -70,21 +75,35 @@ void serve() {
         DWORD error = GetLastError();
         if (!linked && error == ERROR_IO_PENDING) {
             HANDLE waits[] = {stop_event, io_event};
-            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) { CancelIo(pipe); break; }
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) {
+                DWORD ignored = 0; CancelIo(pipe); GetOverlappedResult(pipe, &ov, &ignored, TRUE); break;
+            }
         } else if (!linked && error != ERROR_PIPE_CONNECTED) break;
         { std::lock_guard<std::mutex> g(lock); queues[0].clear(); queues[1].clear(); }
         connected = true;
         printf("[TAP] Listener connected\n");
+        // Pace by the real clock: Windows timers wake late (~15.6 ms steps), so send
+        // however many 8 kHz frames are due rather than a fixed count per wakeup.
+        LARGE_INTEGER frequency, start;
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
+        unsigned long long sent = 0;
         while (WaitForSingleObject(stop_event, 20) == WAIT_TIMEOUT) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            const unsigned long long due_total = (unsigned long long)((now.QuadPart - start.QuadPart) * 8000 / frequency.QuadPart);
+            size_t due = size_t(due_total - sent);
+            if (due > 8000) { sent = due_total - 8000; due = 8000; } // after a stall, send at most 1 s
+            if (!due) continue;
+            frame.resize(due * 2);
             {
                 std::lock_guard<std::mutex> g(lock);
                 for (int c = 0; c < 2; ++c)
-                    for (unsigned i = 0; i < kFrames; ++i) {
+                    for (size_t i = 0; i < due; ++i) {
                         int16_t s = 0;
                         if (!queues[c].empty()) { s = queues[c].front(); queues[c].pop_front(); }
                         frame[i * 2 + c] = s;
                     }
             }
+            sent += due;
             if (!write_all(pipe, io_event, frame.data(), DWORD(frame.size() * sizeof(int16_t)))) break;
         }
         connected = false;

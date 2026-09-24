@@ -15,6 +15,11 @@ if (-not $InstanceId) {
     $saved = Join-Path $PSScriptRoot 'instance.txt'
     if (Test-Path -LiteralPath $saved) { $InstanceId = (Get-Content -LiteralPath $saved -Raw).Trim() }
 }
+if (-not $InstanceId) {
+    # Run by hand from the repo: find the (single) AX201 Bluetooth function by its hardware ID.
+    $InstanceId = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object InstanceId -like 'USB\VID_8087&PID_0026\*' | Select-Object -First 1).InstanceId
+}
 if ($InstanceId -notlike 'USB\VID_8087&PID_0026\*') { Note "No valid AX201 instance id; nothing done"; exit 2 }
 
 function Service() {
