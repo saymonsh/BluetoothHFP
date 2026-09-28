@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.20)
+project(q7_winstack LANGUAGES CXX)
+if(NOT WIN32)
+  message(FATAL_ERROR "This tool requires Windows")
+endif()
+# Call router on Windows' own Bluetooth stack: C++/WinRT headers from the Windows SDK, WASAPI,
+# and the same local call-audio pipe as the bridge (../q7/call_tap.cpp).
+add_executable(q7_winstack q7_winstack.cpp ../q7/call_tap.cpp)
+target_compile_features(q7_winstack PRIVATE cxx_std_17)
+target_compile_definitions(q7_winstack PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_include_directories(q7_winstack PRIVATE .. ../q7)
+target_link_libraries(q7_winstack PRIVATE windowsapp ole32 advapi32 cfgmgr32)
+if(MSVC)
+  target_compile_options(q7_winstack PRIVATE /utf-8 /permissive-)
+  set_source_files_properties(q7_winstack.cpp PROPERTIES COMPILE_OPTIONS /W4)
+endif()
+enable_testing()
+add_test(NAME winstack_selftest COMMAND q7_winstack selftest)

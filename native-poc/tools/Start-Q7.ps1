@@ -2,6 +2,8 @@
 # Windows asks for permission (UAC) twice: once to lend the Bluetooth adapter to the
 # bridge, once to give it back. The bridge itself runs without admin rights.
 # Whatever happens (quit, error, crash), the Windows Bluetooth driver is restored at the end.
+# Pairings are shared both ways (Set-BluetoothDriver.ps1 copies the link keys): a phone or headset
+# paired with Windows works with the bridge too, and nothing has to be unpaired anywhere.
 [CmdletBinding()]
 param([switch]$DebugPacketLog)
 $ErrorActionPreference = 'Stop'
@@ -75,6 +77,7 @@ try {
     Write-Warning $_
 } finally {
     Remove-Item Env:Q7_USB_INSTANCE -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $run 'windows-keys.txt') -ErrorAction SilentlyContinue # a copy of Windows' keys the bridge did not consume
     $restored = Restore-WindowsBluetooth # no-op ("already in Intel mode") if nothing was switched
 }
 Read-Host $(if ($restored) { 'Done. Press Enter to close' } else { 'Bluetooth was NOT restored - read the message above, then press Enter' })

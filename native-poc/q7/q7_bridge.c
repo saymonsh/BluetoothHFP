@@ -7,10 +7,15 @@
 // Security model (see ../../SECURITY-NOTES.md):
 //  - Not discoverable and not bondable except during an explicit pairing window
 //    (key 'p', 120 s) or while connecting to a headset the user asked for (key 'h').
-//  - Incoming connections, SSP confirmations and PIN requests are accepted only
-//    from the saved phone/headset, or inside those windows.
+//  - Incoming connections are accepted only from the saved phone/headset, from phones/headsets
+//    paired with Windows, or inside those windows; SSP confirmations and PIN requests (a new
+//    pairing) only inside those windows.
 //  - Only CVSD is offered (no SBC/AAC/LC3 decoders, no A2DP/AVRCP).
 //  - No packet log unless Q7_DEBUG_PKLG is set, and then without link keys/PINs.
+// Pairings are shared with Windows (same adapter address, so one side's pairing would otherwise
+// break the other's): Windows' link keys for phones/headsets are taken over at startup (windows-keys.txt),
+// and a key the bridge creates for its phone or headset is handed back (bridge-new-keys.txt). Both files
+// are exchanged with Set-BluetoothDriver.ps1 in this private run folder; nobody has to remove a device anywhere.
 // Explicit headers instead of btstack.h, which pulls in codec headers we don't build.
 #include "btstack_defines.h"
 #include "btstack_event.h"
@@ -82,17 +87,35 @@ static void devices_load(void) {
     fclose(f);
 }
 
+// Class of device: major class Phone; or Audio/Video with minor Wearable Headset, Hands-free or Headphones.
+static int phone_class(uint32_t cod) { return ((cod >> 8) & 0x1f) == 0x02; }
+static int headset_class(uint32_t cod) {
+    const unsigned minor = (cod >> 2) & 0x3f;
+    return ((cod >> 8) & 0x1f) == 0x04 && (minor == 0x01 || minor == 0x02 || minor == 0x06);
+}
+
 // ---- access control ----------------------------------------------------------
 static int pairing_open;
 static btstack_timer_source_t pairing_timer;
+// ponytail: at most 8 devices taken over from Windows (2 of those places kept for the saved phone and
+// headset), so at least 8 entries of the 16-entry TLV key store (NVM_NUM_LINK_KEYS; the least recently
+// stored key is evicted first) stay for the bridge's own keys; raise both if more are ever needed.
+#define MAX_WINDOWS_PAIRED 8
+static bd_addr_t windows_paired[MAX_WINDOWS_PAIRED]; // phones/headsets whose Windows key we took over
+static int windows_paired_count;
 
 static int known(const bd_addr_t addr) {
     return (have_phone && bd_addr_cmp(addr, phone_addr) == 0) ||
            (have_headset && bd_addr_cmp(addr, headset_addr) == 0) ||
            (have_pending && bd_addr_cmp(addr, pending_headset) == 0);
 }
-// Who may connect at all (connection filter).
-static int allowed(const bd_addr_t addr) { return pairing_open || known(addr); }
+static int paired_in_windows(const bd_addr_t addr) {
+    for (int i = 0; i < windows_paired_count; ++i) if (bd_addr_cmp(addr, windows_paired[i]) == 0) return 1;
+    return 0;
+}
+// Who may connect at all (connection filter). A device paired with Windows must still
+// authenticate with its link key; a new pairing needs the pairing window as before.
+static int allowed(const bd_addr_t addr) { return pairing_open || known(addr) || paired_in_windows(addr); }
 // Who may (re-)pair. Saved devices must authenticate with their stored link key;
 // if a saved device lost its key, the user re-pairs it through 'p' or 'h'.
 static int pairing_allowed(const bd_addr_t addr) {
@@ -129,6 +152,130 @@ static void pairing_start(void) {
 // Printable copy of an untrusted remote name (no control or escape characters).
 static void sanitize(char * text) {
     for (; *text; ++text) if ((unsigned char)*text < 0x20 || *text == 0x7f) *text = '?';
+}
+
+// ---- link keys shared with Windows ---------------------------------------------------------
+// Windows is the source of truth. Just before lending us the adapter, Set-BluetoothDriver.ps1
+// (elevated) copies Windows' BR/EDR link keys for it into windows-keys.txt:
+//   "AA:BB:CC:DD:EE:FF <32 hex key bytes> <class of device hex> <name>"
+// We take them over (they win over our own key for the same device) and delete the file.
+//
+// Byte order: none is changed. Windows keeps the key (Keys\<adapter>\<device>, REG_BINARY) in the
+// order the controller uses in HCI Link_Key_Notification / Link_Key_Request_Reply, and BTstack does
+// too (hci.c stores &packet[8] as is; the 'P' format in hci_cmd.c copies it unchanged). Evidence:
+// dual-boot guides copy the Windows value unchanged into BlueZ's [LinkKey] Key= (e.g.
+// nullroute.lt/~grawity/bluetooth-key-sharing.html: ac,79,e3,...,63 -> Key=AC79E3...63), and BlueZ
+// converts that string byte by byte (src/adapter.c store_link_key / get_key_info) into the key the
+// Linux kernel memcpy's into Link_Key_Request_Reply.
+//
+// Type: Windows does not store it. UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192 maps to
+// security level 2 (gap_security_level_for_link_key_type), which is what HFP's RFCOMM channels
+// require here (BTstack default level), so hci_run() answers the controller's Link Key Request with
+// the key instead of a negative reply (which would start a new pairing, refused outside the pairing
+// window). It is not a Secure Connections type, so the BIAS check on Encryption Change can never
+// drop a link over a type we only guessed, and it never claims MITM protection we cannot prove.
+static int hex_key(const char * text, link_key_t key) {
+    if (strlen(text) != 2 * LINK_KEY_LEN) return 0;
+    uint8_t any = 0;
+    for (int i = 0; i < LINK_KEY_LEN; ++i) {
+        const int high = nibble_for_char(text[2 * i]), low = nibble_for_char(text[2 * i + 1]);
+        if (high < 0 || low < 0) return 0;
+        any |= key[i] = (uint8_t)(high << 4 | low);
+    }
+    return any != 0;
+}
+static btstack_link_key_db_t key_db; // the TLV key store, with put_link_key wrapped (see main)
+static void (*store_key)(bd_addr_t addr, link_key_t key, link_key_type_t type); // its own put_link_key
+
+static void import_windows_keys(void) {
+    FILE * f = fopen("windows-keys.txt", "r");
+    if (!f) { say("[KEYS] Windows pairings were not shared this time (see driver-switch.log); using the bridge's own\n"); return; }
+    char line[200], addr_text[32], key_text[40], name[64];
+    unsigned cod;
+    bd_addr_t addr, phone_pick, headset_pick;
+    link_key_t key, current;
+    link_key_type_t type;
+    int phones = 0, headsets = 0;
+    while (fgets(line, sizeof(line), f)) {
+        strcpy_s(name, sizeof(name), "(no name)");
+        if (sscanf(line, "%31s %39s %x %63[^\r\n]", addr_text, key_text, &cod, name) < 3 ||
+            !sscanf_bd_addr(addr_text, addr) || !hex_key(key_text, key)) { say("[KEYS] Skipped a malformed line in windows-keys.txt\n"); continue; }
+        // Only phones, headsets and the saved devices: other Windows pairings (keyboards...) are not ours,
+        // and would only push our own keys out of the small key store.
+        const int saved = (have_phone && bd_addr_cmp(addr, phone_addr) == 0) || (have_headset && bd_addr_cmp(addr, headset_addr) == 0);
+        if (!saved && !phone_class(cod) && !headset_class(cod)) continue;
+        // Counted before the cap, so "exactly one" below is about all of them.
+        if (phone_class(cod)) { bd_addr_copy(phone_pick, addr); phones++; }
+        if (headset_class(cod)) { bd_addr_copy(headset_pick, addr); headsets++; }
+        if (windows_paired_count == MAX_WINDOWS_PAIRED || (!saved && windows_paired_count >= MAX_WINDOWS_PAIRED - 2)) {
+            say("[KEYS] Too many phones/headsets paired in Windows; ignoring %s\n", bd_addr_to_str(addr));
+            continue;
+        }
+        if (!gap_get_link_key_for_bd_addr(addr, current, &type) || memcmp(current, key, LINK_KEY_LEN) != 0)
+            store_key(addr, key, UNAUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P192); // unwrapped: not a new pairing
+        bd_addr_copy(windows_paired[windows_paired_count++], addr);
+        sanitize(name);
+        say("[KEYS] Paired in Windows: %s %s\n", name, bd_addr_to_str(addr));
+    }
+    fclose(f);
+    if (remove("windows-keys.txt") != 0) say("[KEYS] Could not delete windows-keys.txt\n");
+    // Nothing saved yet: use the phone/headset Windows has paired, but only when there is exactly one.
+    if (!have_phone && phones == 1 && paired_in_windows(phone_pick)) {
+        bd_addr_copy(phone_addr, phone_pick); have_phone = 1;
+        say("[KEYS] Using the phone paired in Windows: %s\n", bd_addr_to_str(phone_addr));
+    } else if (!have_phone && phones > 1) say("[KEYS] %d phones are paired in Windows; press p to choose one\n", phones);
+    if (!have_headset && headsets == 1 && paired_in_windows(headset_pick)) {
+        bd_addr_copy(headset_addr, headset_pick); have_headset = 1;
+        say("[KEYS] Using the headset paired in Windows: %s\n", bd_addr_to_str(headset_addr));
+    } else if (!have_headset && headsets > 1) say("[KEYS] %d headsets are paired in Windows; press h to choose one\n", headsets);
+}
+
+// Bridge -> Windows. Every key BTstack stores (new pairing, or a key the remote changed) passes through
+// here and is remembered with the key it replaced, which Windows holds too after the import above (or
+// from an earlier hand-back). It is written to bridge-new-keys.txt only once that device is accepted as
+// our phone or headset (queue_key_for_windows), never for anything else that paired in a window.
+// Set-BluetoothDriver.ps1 -Mode Intel then copies it into Windows only while Windows still holds the
+// replaced key (compare-and-swap), so a pairing Windows made in the meantime is never overwritten.
+// A device we had no key for is new to us, and (keys being shared) to Windows too: nothing to hand back.
+#define MAX_NEW_KEYS 4
+static struct { bd_addr_t addr; link_key_t key, base; } new_keys[MAX_NEW_KEYS];
+static int new_key_count;
+static int new_key_index(const bd_addr_t addr) {
+    int i = 0;
+    while (i < new_key_count && bd_addr_cmp(new_keys[i].addr, addr) != 0) ++i;
+    return i;
+}
+static void store_key_remembering_base(bd_addr_t addr, link_key_t key, link_key_type_t type) {
+    link_key_t base;
+    link_key_type_t base_type;
+    const int i = new_key_index(addr);
+    if (i < new_key_count) memcpy(new_keys[i].key, key, LINK_KEY_LEN); // changed again before it was queued: same base
+    else if (key_db.get_link_key(addr, base, &base_type) && memcmp(base, key, LINK_KEY_LEN) != 0) {
+        if (i == MAX_NEW_KEYS) say("[KEYS] Too many new pairings; Windows keeps its old key for %s\n", bd_addr_to_str(addr));
+        else {
+            bd_addr_copy(new_keys[i].addr, addr);
+            memcpy(new_keys[i].key, key, LINK_KEY_LEN);
+            memcpy(new_keys[i].base, base, LINK_KEY_LEN);
+            new_key_count++;
+        }
+    }
+    store_key(addr, key, type);
+}
+static void queue_key_for_windows(const bd_addr_t addr) {
+    const int i = new_key_index(addr);
+    if (i == new_key_count) return;
+    FILE * f = fopen("bridge-new-keys.txt", "a");
+    if (!f) say("[KEYS] Cannot write bridge-new-keys.txt; Windows keeps its old key for %s\n", bd_addr_to_str(addr));
+    else {
+        fprintf(f, "%s ", bd_addr_to_str(addr));
+        for (int k = 0; k < LINK_KEY_LEN; ++k) fprintf(f, "%02x", new_keys[i].key[k]);
+        fprintf(f, " ");
+        for (int k = 0; k < LINK_KEY_LEN; ++k) fprintf(f, "%02x", new_keys[i].base[k]);
+        fprintf(f, "\n");
+        fclose(f);
+        say("[KEYS] The new pairing with %s will also be given to Windows (if Windows has paired it)\n", bd_addr_to_str(addr));
+    }
+    new_keys[i] = new_keys[--new_key_count];
 }
 
 // ---- connection state ----------------------------------------------------------
@@ -257,6 +404,7 @@ static void phone_event(uint8_t type, uint16_t channel, uint8_t * event, uint16_
                 pairing_close(NULL); // one enrollment per window
             }
             phone_acl = hfp_subevent_service_level_connection_established_get_acl_handle(event);
+            queue_key_for_windows(addr); // only now is a new key known to belong to our phone
             say("[PHONE] Connected: %s\n", bd_addr_to_str(addr));
             break;
         case HFP_SUBEVENT_SERVICE_LEVEL_CONNECTION_RELEASED:
@@ -319,6 +467,7 @@ static void headset_event(uint8_t type, uint16_t channel, uint8_t * event, uint1
             }
             headset_acl = hfp_subevent_service_level_connection_established_get_acl_handle(event);
             if (was_pending) { bd_addr_copy(headset_addr, addr); have_headset = 1; devices_save(); }
+            queue_key_for_windows(addr); // only now is a new key known to belong to our headset
             say("[HEADSET] Connected: %s\n", bd_addr_to_str(addr));
             if (phone_sco != HCI_CON_HANDLE_INVALID) hfp_ag_establish_audio_connection(headset_acl);
             break;
@@ -496,10 +645,7 @@ static void gap_event(uint8_t type, uint16_t channel, uint8_t * packet, uint16_t
         case GAP_EVENT_INQUIRY_RESULT: {
             gap_event_inquiry_result_get_bd_addr(packet, addr);
             const uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
-            // Headset-like: major class Audio/Video with minor Wearable Headset, Hands-free or Headphones.
-            const unsigned minor = (cod >> 2) & 0x3f;
-            const int headset_like = ((cod >> 8) & 0x1f) == 0x04 && (minor == 0x01 || minor == 0x02 || minor == 0x06);
-            if (!searching || !headset_like || (have_phone && bd_addr_cmp(addr, phone_addr) == 0)) break;
+            if (!searching || !headset_class(cod) || (have_phone && bd_addr_cmp(addr, phone_addr) == 0)) break;
             int seen = 0;
             for (int i = 0; i < candidate_count; ++i) if (bd_addr_cmp(candidates[i].addr, addr) == 0) seen = 1;
             if (seen || candidate_count == MAX_CANDIDATES) break;
@@ -600,7 +746,12 @@ int main(void) {
     hci_init(hci_transport_usb_instance(), NULL);
     const btstack_tlv_t * tlv = btstack_tlv_windows_init_instance(&tlv_context, "link-keys.tlv");
     btstack_tlv_set_instance(tlv, &tlv_context);
-    hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv, &tlv_context));
+    // Like filtered_dump: a copy of the key store with one function replaced, to see every key hci.c stores.
+    key_db = *btstack_link_key_db_tlv_get_instance(tlv, &tlv_context);
+    store_key = key_db.put_link_key;
+    key_db.put_link_key = store_key_remembering_base;
+    hci_set_link_key_db(&key_db);
+    import_windows_keys(); // the TLV file is open already, so the key store works before power-on
 
     l2cap_init();
     rfcomm_init();

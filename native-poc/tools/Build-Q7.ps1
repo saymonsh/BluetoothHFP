@@ -1,4 +1,4 @@
-# Builds the Q7 bridge, the AX201 probe and the driver helper. Run as a NORMAL user (no admin).
+# Builds the Q7 bridge, the AX201 probe, the driver helper and the Windows-stack call router. Run as a NORMAL user (no admin).
 # Downloads only the needed folders of BTstack at one pinned commit and verifies the commit.
 [CmdletBinding()]
 param()
@@ -80,4 +80,6 @@ function Build([string]$sourceDir, [string]$buildDir, [string[]]$extra) {
 }
 Build (Join-Path $repo 'native-poc') (Join-Path $repo 'build\ax201-poc') @()
 Build (Join-Path $repo 'native-poc\q7') $build @("-DBTSTACK_ROOT=$($source.Replace('\','/'))", "-DPATCHED_TRANSPORT=$($patched.Replace('\','/'))", "-DPATCHED_HCI=$($patchedHci.Replace('\','/'))")
+Build (Join-Path $repo 'native-poc\winstack') (Join-Path $repo 'build\winstack') @()
 Write-Output "[BUILD] $build\Release\q7_bridge.exe"
+Write-Output "[BUILD] $(Join-Path $repo 'build\winstack\Release\q7_winstack.exe')"

@@ -10,6 +10,10 @@ $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIde
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run as administrator' }
 $task = 'Q7 Bluetooth safety net'
 $target = Join-Path $env:ProgramData 'Q7Handsfree'
+# The folder is recreated below; it may hold the record of Bluetooth devices disabled for the bridge.
+if (Test-Path -LiteralPath (Join-Path $target 'disabled-devnodes.txt')) {
+    throw "Some Bluetooth devices are still disabled for the bridge (recorded in $target). Run native-poc\tools\Restore-Bluetooth.ps1 as administrator first."
+}
 Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
 # Never reuse an existing folder: a normal user could have created it first and kept control of it.
 if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
