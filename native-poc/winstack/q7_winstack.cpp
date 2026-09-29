@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cwctype>
 #include <string>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include "audio/audio_ring_buffer.h"
@@ -204,9 +205,32 @@ std::vector<Endpoint> audio_endpoints() {
     check_hresult(enumerator->EnumAudioEndpoints(eAll, DEVICE_STATEMASK_ALL, collection.put()));
     UINT count = 0;
     check_hresult(collection->GetCount(&count));
+    std::vector<com_ptr<IMMDevice>> devices;
     for (UINT i = 0; i < count; ++i) {
         com_ptr<IMMDevice> device;
-        if (FAILED(collection->Item(i, device.put()))) continue;
+        if (SUCCEEDED(collection->Item(i, device.put()))) devices.push_back(device);
+    }
+    // Seen 2026-09-29: the phone's hands-free call endpoints ("Q7 Hands-Free HF Audio") are active and
+    // open fine, but EnumAudioEndpoints leaves them out. Plug and Play lists every present endpoint as
+    // SWD\MMDEVAPI\<endpoint id>, so add those it missed.
+    ULONG size = 0;
+    if (CM_Get_Device_ID_List_SizeW(&size, L"SWD\\MMDEVAPI", CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT) == CR_SUCCESS) {
+        std::vector<wchar_t> ids(size);
+        if (CM_Get_Device_ID_ListW(L"SWD\\MMDEVAPI", ids.data(), size, CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT) == CR_SUCCESS)
+            for (const wchar_t* p = ids.data(); *p; p += wcslen(p) + 1) {
+                const std::wstring instance = p, prefix = L"SWD\\MMDEVAPI\\";
+                if (instance.compare(0, prefix.size(), prefix) != 0) continue;
+                com_ptr<IMMDevice> device;
+                if (FAILED(enumerator->GetDevice(instance.substr(prefix.size()).c_str(), device.put()))) continue;
+                LPWSTR id = nullptr;
+                if (FAILED(device->GetId(&id))) continue;
+                const bool known = std::any_of(devices.begin(), devices.end(), [&](const com_ptr<IMMDevice>& d) {
+                    LPWSTR other = nullptr; bool same = SUCCEEDED(d->GetId(&other)) && _wcsicmp(other, id) == 0; CoTaskMemFree(other); return same; });
+                CoTaskMemFree(id);
+                if (!known) devices.push_back(device);
+            }
+    }
+    for (const auto& device : devices) {
         Endpoint e;
         LPWSTR id = nullptr;
         if (FAILED(device->GetId(&id))) continue;
@@ -431,6 +455,49 @@ int connect(const std::wstring& text, bool undo) {
     return connect_steps(transport, tag, registered_here) ? 0 : 1;
 }
 
+// Moves this phone's talking call to the PC (like upstream phone_transport.cpp TransferActiveCall).
+// Never dials, answers or touches calls of another phone.
+int transfer(const std::wstring& text) {
+    const char* tag = "[TRANSFER]";
+    BtDevice phone;
+    phone.address = normalize_address(text);
+    if (phone.address.empty()) { printf("%s '%s' is not a Bluetooth address\n", tag, u8(text).c_str()); return 2; }
+    for (const auto& d : paired_devices()) if (d.address == phone.address) phone = d;
+    const auto transport = find_transport(phone, tag);
+    if (!transport) return 1;
+    const auto store = wait(PhoneCallManager::RequestStoreAsync());
+    if (!store) { printf("%s Windows exposed no call store\n", tag); return 1; }
+    std::vector<guid> ids;
+    std::atomic<bool> done{false};
+    std::mutex lock;
+    auto watcher = store.RequestLineWatcher();
+    watcher.LineAdded([&](auto const&, auto const& args) { std::lock_guard<std::mutex> g(lock); ids.push_back(args.LineId()); });
+    watcher.EnumerationCompleted([&](auto const&, auto const&) { done = true; });
+    watcher.Start();
+    for (int i = 0; i < 200 && !done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    watcher.Stop();
+    std::vector<guid> lines;
+    { std::lock_guard<std::mutex> g(lock); lines = ids; }
+    for (const auto& id : lines) {
+        const auto line = wait(PhoneLine::FromIdAsync(id));
+        if (!line || line.TransportDeviceId() != transport.DeviceId()) continue;
+        const auto result = wait(line.GetAllActivePhoneCallsAsync());
+        if (result.OperationStatus() != PhoneLineOperationStatus::Succeeded) { printf("%s Cannot list calls (status %d)\n", tag, int(result.OperationStatus())); return 1; }
+        for (const auto& call : result.AllActivePhoneCalls()) {
+            printf("%s Call: status %d, audio on %s\n", tag, int(call.Status()), call.AudioDevice() == PhoneCallAudioDevice::LocalDevice ? "PC" : "phone");
+            if (call.Status() != PhoneCallStatus::Talking) continue;
+            if (call.AudioDevice() == PhoneCallAudioDevice::LocalDevice) { printf("%s Already on the PC\n", tag); return 0; }
+            const auto changed = wait(call.ChangeAudioDeviceAsync(PhoneCallAudioDevice::LocalDevice));
+            printf("%s ChangeAudioDeviceAsync: %s (%d)\n", tag, changed == PhoneCallOperationStatus::Succeeded ? "moved to the PC" : "refused", int(changed));
+            return changed == PhoneCallOperationStatus::Succeeded ? 0 : 1;
+        }
+        printf("%s No talking call on this phone's line\n", tag);
+        return 1;
+    }
+    printf("%s Windows exposed no phone line for this phone (%zu line(s) in total)\n", tag, lines.size());
+    return 1;
+}
+
 // ---- route ----
 
 struct Failure { HRESULT hr; const char* step; };
@@ -590,6 +657,7 @@ void usage() {
     printf("Usage:\n"
            "  q7_winstack list                        paired Bluetooth devices, phone transports, all audio endpoints\n"
            "  q7_winstack connect <phone address>     ask Windows for this phone's call transport, step by step\n"
+           "  q7_winstack transfer <phone address>    move the talking call to the PC\n"
            "  q7_winstack disconnect <phone address>  undo this tool's call transport registration\n"
            "  q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect]\n"
            "                                          --connect: hold the phone's call transport connected while routing\n"
@@ -804,6 +872,7 @@ int wmain(int argc, wchar_t** argv) {
         init_apartment(apartment_type::multi_threaded);
         const std::wstring command = argc > 1 ? argv[1] : L"";
         if (command == L"list" && argc == 2) result = list();
+        else if (command == L"transfer" && argc == 3) result = transfer(argv[2]);
         else if ((command == L"connect" || command == L"disconnect") && argc == 3) result = connect(argv[2], command == L"disconnect");
         else if (command == L"route") result = route(argc - 2, argv + 2);
         else if (command == L"selftest" && argc == 2) result = selftest();

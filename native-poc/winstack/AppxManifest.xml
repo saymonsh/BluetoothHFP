@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Package identity for q7_winstack.exe, so Windows lets it manage the phone's hands-free link
+     (PhoneLineTransportDevice needs identity + phoneLineTransportManagement + windows.phoneCallActivation).
+     Registered as a local developer package by Register-WinStack.ps1 (needs Developer Mode). -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:uap13="http://schemas.microsoft.com/appx/manifest/uap/windows10/13"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 uap10 uap13 desktop4 rescap">
+  <Identity Name="Q7Bridge.WinStack" Publisher="CN=Q7Bridge" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Q7 Windows-stack router</DisplayName>
+    <PublisherDisplayName>Q7Bridge</PublisherDisplayName>
+    <Logo>logo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="WinStack" Executable="q7_winstack.exe" EntryPoint="Windows.FullTrustApplication"
+                 desktop4:Subsystem="console" desktop4:SupportsMultipleInstances="true" uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">
+      <uap:VisualElements DisplayName="Q7 Windows-stack router" Description="Routes Q7 call audio on Windows' Bluetooth stack"
+                          BackgroundColor="transparent" Square150x150Logo="logo.png" Square44x44Logo="logo.png" AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console"><uap5:ExecutionAlias Alias="q7-winstack.exe" /></uap5:AppExecutionAlias>
+        </uap5:Extension>
+        <uap13:Extension Category="windows.phoneCallActivation" />
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="phoneLineTransportManagement" />
+    <uap:Capability Name="phoneCall" />
+    <DeviceCapability Name="bluetooth" />
+    <DeviceCapability Name="microphone" />
+  </Capabilities>
+</Package>
