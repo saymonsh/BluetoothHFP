@@ -390,7 +390,12 @@ bool connect_steps(const PhoneLineTransportDevice& transport, const char* tag, b
             registered_here = transport.IsRegistered();
             printf("%s RegisterApp: done; IsRegistered now: %s\n", tag, yes_no(registered_here));
         }
-    } catch (const hresult_error& e) { printf("%s RegisterApp failed: %s\n", tag, failure(e).c_str()); }
+    } catch (const hresult_error& e) {
+        printf("%s RegisterApp failed: %s\n", tag, failure(e).c_str());
+        // Seen 2026-09-29 on this PC: after this refusal ConnectAsync crashed the process (0xC0000005).
+        printf("%s ConnectAsync skipped: Windows refused the registration it needs\n", tag);
+        return false;
+    }
     // A RegisterApp can leave IsRegistered false (experimental BypassRegistration); ConnectAsync reports the truth.
     bool connected = false;
     try {
