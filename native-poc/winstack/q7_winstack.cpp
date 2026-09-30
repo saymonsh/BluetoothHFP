@@ -7,7 +7,7 @@
 // The same two streams feed the local call-audio pipe served by ../q7/call_tap.cpp.
 //   q7_winstack list
 //   q7_winstack connect <phone address> | disconnect <phone address>
-//   q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect] [--stereo]
+//   q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect] [--stereo] [--follow]
 //   q7_winstack selftest
 // --stereo fits the laptop's one call-audio link: the headset plays the call as stereo
 // headphones and your voice comes from the PC's default microphone instead of the headset's.
@@ -477,18 +477,10 @@ int connect(const std::wstring& text, bool undo) {
     return connect_steps(transport, tag, registered_here) ? 0 : 1;
 }
 
-// Moves this phone's talking call to the PC (like upstream phone_transport.cpp TransferActiveCall).
-// Never dials, answers or touches calls of another phone.
-int transfer(const std::wstring& text) {
-    const char* tag = "[TRANSFER]";
-    BtDevice phone;
-    phone.address = normalize_address(text);
-    if (phone.address.empty()) { printf("%s '%s' is not a Bluetooth address\n", tag, u8(text).c_str()); return 2; }
-    for (const auto& d : paired_devices()) if (d.address == phone.address) phone = d;
-    const auto transport = find_transport(phone, tag);
-    if (!transport) return 1;
+// This phone's call line, or null (says why).
+PhoneLine find_line(const PhoneLineTransportDevice& transport, const char* tag) {
     const auto store = wait(PhoneCallManager::RequestStoreAsync());
-    if (!store) { printf("%s Windows exposed no call store\n", tag); return 1; }
+    if (!store) { printf("%s Windows exposed no call store\n", tag); return nullptr; }
     std::vector<guid> ids;
     std::atomic<bool> done{false};
     std::mutex lock;
@@ -502,23 +494,46 @@ int transfer(const std::wstring& text) {
     { std::lock_guard<std::mutex> g(lock); lines = ids; }
     for (const auto& id : lines) {
         const auto line = wait(PhoneLine::FromIdAsync(id));
-        if (!line || line.TransportDeviceId() != transport.DeviceId()) continue;
-        const auto result = wait(line.GetAllActivePhoneCallsAsync());
-        if (result.OperationStatus() != PhoneLineOperationStatus::Succeeded) { printf("%s Cannot list calls (status %d)\n", tag, int(result.OperationStatus())); return 1; }
-        for (const auto& call : result.AllActivePhoneCalls()) {
-            printf("%s Call: status %d, audio on %s\n", tag, int(call.Status()), call.AudioDevice() == PhoneCallAudioDevice::LocalDevice ? "PC" : "phone");
-            // Dialing too: Windows can miss the Q7's "answered" update and keep an outgoing call at Dialing.
-            if (call.Status() != PhoneCallStatus::Talking && call.Status() != PhoneCallStatus::Dialing) continue;
-            if (call.AudioDevice() == PhoneCallAudioDevice::LocalDevice) { printf("%s Already on the PC\n", tag); return 0; }
-            const auto changed = wait(call.ChangeAudioDeviceAsync(PhoneCallAudioDevice::LocalDevice));
-            printf("%s ChangeAudioDeviceAsync: %s (%d)\n", tag, changed == PhoneCallOperationStatus::Succeeded ? "moved to the PC" : "refused", int(changed));
-            return changed == PhoneCallOperationStatus::Succeeded ? 0 : 1;
-        }
-        printf("%s No talking call on this phone's line\n", tag);
-        return 1;
+        if (line && line.TransportDeviceId() == transport.DeviceId()) return line;
     }
     printf("%s Windows exposed no phone line for this phone (%zu line(s) in total)\n", tag, lines.size());
-    return 1;
+    return nullptr;
+}
+
+enum class CallAudio { None, OnPc, Moved, Refused };
+// Moves the line's talking call to the PC (like upstream phone_transport.cpp TransferActiveCall).
+// Never dials, answers or touches calls of another phone. verbose: print the call's state.
+CallAudio move_call(const PhoneLine& line, const char* tag, bool verbose) {
+    const auto result = wait(line.GetAllActivePhoneCallsAsync());
+    if (result.OperationStatus() != PhoneLineOperationStatus::Succeeded) { printf("%s Cannot list calls (status %d)\n", tag, int(result.OperationStatus())); return CallAudio::None; }
+    for (const auto& call : result.AllActivePhoneCalls()) {
+        if (verbose) printf("%s Call: status %d, audio on %s\n", tag, int(call.Status()), call.AudioDevice() == PhoneCallAudioDevice::LocalDevice ? "PC" : "phone");
+        // Dialing too: Windows can miss the Q7's "answered" update and keep an outgoing call at Dialing.
+        if (call.Status() != PhoneCallStatus::Talking && call.Status() != PhoneCallStatus::Dialing) continue;
+        if (call.AudioDevice() == PhoneCallAudioDevice::LocalDevice) return CallAudio::OnPc;
+        const auto changed = wait(call.ChangeAudioDeviceAsync(PhoneCallAudioDevice::LocalDevice));
+        if (changed != PhoneCallOperationStatus::Succeeded) printf("%s ChangeAudioDeviceAsync refused (%d)\n", tag, int(changed));
+        return changed == PhoneCallOperationStatus::Succeeded ? CallAudio::Moved : CallAudio::Refused;
+    }
+    return CallAudio::None;
+}
+
+int transfer(const std::wstring& text) {
+    const char* tag = "[TRANSFER]";
+    BtDevice phone;
+    phone.address = normalize_address(text);
+    if (phone.address.empty()) { printf("%s '%s' is not a Bluetooth address\n", tag, u8(text).c_str()); return 2; }
+    for (const auto& d : paired_devices()) if (d.address == phone.address) phone = d;
+    const auto transport = find_transport(phone, tag);
+    if (!transport) return 1;
+    const auto line = find_line(transport, tag);
+    if (!line) return 1;
+    switch (move_call(line, tag, true)) {
+        case CallAudio::OnPc: printf("%s Already on the PC\n", tag); return 0;
+        case CallAudio::Moved: printf("%s ChangeAudioDeviceAsync: moved to the PC\n", tag); return 0;
+        case CallAudio::Refused: return 1;
+        default: printf("%s No talking call on this phone's line\n", tag); return 1;
+    }
 }
 
 // ---- route ----
@@ -540,7 +555,8 @@ struct Stream {
     const char* label = "";
     std::wstring id;
     bool capture = false;
-    int tap = -1;              // call_tap channel for captures: 0 = other party, 1 = user
+    bool call = true;          // opened as call audio (Communications); false for --stereo's headset output
+    int tap = -1;             // call_tap channel for captures: 0 = other party, 1 = user
     AudioRing* ring = nullptr; // captures push, renders pull
     std::atomic<uint64_t> frames{0};
     std::atomic<int> peak{0};
@@ -565,7 +581,9 @@ void stream_once(Stream& s, HANDLE stop, Failure& last) {
     com_ptr<IAudioClient> client;
     check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client.put_void()), "activate");
     // Call audio, so a Bluetooth endpoint uses its hands-free mode. Optional: ignore a refusal.
-    if (const auto client2 = client.try_as<IAudioClient2>()) {
+    // Not for --stereo's headset output: Windows would try the headset's (switched off) hands-free
+    // mode and invalidate the stereo endpoint (AUDCLNT_E_DEVICE_INVALIDATED on every retry).
+    if (const auto client2 = s.call ? client.try_as<IAudioClient2>() : nullptr) {
         AudioClientProperties properties{};
         properties.cbSize = sizeof(properties);
         properties.eCategory = AudioCategory_Communications;
@@ -686,17 +704,19 @@ void usage() {
            "                                          --connect: hold the phone's call transport connected while routing\n"
            "                                          --stereo: headset as stereo headphones, your voice from the PC's default mic\n"
            "                                                    (one call-audio link in total: the phone's)\n"
+           "                                          --follow: keep the phone's call on the PC; stop once no call is left\n"
            "  q7_winstack selftest\n");
 }
 
 int route(int argc, wchar_t** argv) {
     std::wstring phone_wanted, headset_wanted;
     unsigned long seconds = 0;
-    bool connect_first = false, stereo = false;
+    bool connect_first = false, stereo = false, follow = false;
     for (int i = 0; i < argc; ++i) {
         const std::wstring flag = argv[i];
         if (flag == L"--connect") { connect_first = true; continue; }
         if (flag == L"--stereo") { stereo = true; continue; }
+        if (flag == L"--follow") { follow = true; continue; }
         if (i + 1 >= argc) { usage(); return 2; }
         const wchar_t* value = argv[++i];
         if (flag == L"--phone") phone_wanted = value;
@@ -771,6 +791,14 @@ int route(int argc, wchar_t** argv) {
         release();
         return 2;
     }
+    // --follow: one line object for the whole call. A separate `transfer` process every few seconds
+    // cut the call audio for ~1 s each time (2026-09-30), so the call is watched from here instead.
+    PhoneLine line{nullptr};
+    if (follow) {
+        if (!transport) transport = find_transport(*phone, "[CALL]");
+        if (transport) line = find_line(transport, "[CALL]");
+        if (!line) { release(); return 2; }
+    }
     const std::string radio = sco_routing();
     printf("[ROUTE] Phone:   %s (%s)\n[ROUTE] Headset: %s (%s)\n[ROUTE] Radio:   %s\n", u8(phone->name).c_str(), pretty(phone->address).c_str(),
            u8(headset->name).c_str(), pretty(headset->address).c_str(), radio.c_str());
@@ -792,13 +820,14 @@ int route(int argc, wchar_t** argv) {
         streams[i].label = kLabels[i];
         streams[i].id = picks[i]->id;
         streams[i].capture = picks[i]->capture;
+        streams[i].call = !(stereo && i == 1);
         streams[i].tap = taps[i];
         streams[i].ring = rings[i];
         streams[i].worker = std::thread(stream_worker, std::ref(streams[i]), stop);
     }
     printf("[ROUTE] Routing call audio. Ctrl+C stops.\n");
     uint64_t last[4] = {};
-    int streak = 0, longest = 0;
+    int streak = 0, longest = 0, idle = 0;
     bool announced = false;
     for (unsigned long second = 1; WaitForSingleObject(stop, 1000) == WAIT_TIMEOUT; ++second) {
         std::array<Tick, 4> ticks;
@@ -820,6 +849,12 @@ int route(int argc, wchar_t** argv) {
             printf(stereo ? "[VERDICT] Call audio flows both ways (headset stereo + PC mic)\n" : "[VERDICT] Two call-audio links active at once\n");
         }
         if (seconds && second >= seconds) break;
+        if (line) {
+            const CallAudio call = move_call(line, "[CALL]", false);
+            if (call == CallAudio::Moved) printf("[CALL] %lus: the call audio was on the phone; moved it back to the PC\n", second);
+            idle = call == CallAudio::None ? idle + 1 : 0;
+            if (idle >= 3) { printf("[CALL] No call for 3 s: stopping\n"); break; }
+        }
     }
     SetEvent(stop);
     for (auto& s : streams) s.worker.join();
