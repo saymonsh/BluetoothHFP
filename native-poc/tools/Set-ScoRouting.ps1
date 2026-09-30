@@ -2,7 +2,7 @@
 # decisive test: can two call-audio links (phone + headset) run at the same time?
 #   Sideband - "Sco Support Type"=2 (how Windows runs it now): call audio goes over a side wire to
 #              the Intel Smart Sound audio DSP, and Windows supports only ONE such link.
-#   InBand   - "Sco Support Type"=0 (the value Intel's own INF sets; ASSUMED to mean in-band, where the
+#   InBand   - "Sco Support Type"=1 (ScoSupportHCI; -InBandValue 0 = Intel's INF value, which gave no call audio here), where the
 #              Windows stack allows "SCO Max Channels" links - unverified) plus "HfpOffloadDisable"=1.
 #              The runtime 2 most likely comes from Intel's filter driver on this adapter (ibtusb.sys,
 #              the only Intel driver here that holds these value names; the meaning of HfpOffloadDisable
@@ -16,7 +16,9 @@
 # in-band, Windows call audio for Bluetooth headsets may not work.
 # Log: .local\q7-run\sco-routing.log. Compatible with Windows PowerShell 5.1 and PowerShell 7.
 [CmdletBinding()]
-param([ValidateSet('Status','InBand','Sideband')][string]$Mode = 'Status')
+param([ValidateSet('Status','InBand','Sideband')][string]$Mode = 'Status',
+      # 0 = Intel's INF value (on this PC it gave NO call audio at all, 2026-09-29); 1 = ScoSupportHCI, in-band by definition.
+      [ValidateSet(0,1)][int]$InBandValue = 1)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $local = Join-Path $repo '.local'
@@ -133,7 +135,7 @@ if ($Mode -eq 'InBand') {
             ConvertTo-Json -Depth 4 | Out-File -LiteralPath $backupFile -Encoding utf8 -NoClobber
         Note "Saved the original values to $backupFile"
     }
-    $target = [ordered]@{ 'Sco Support Type' = 0; 'HfpOffloadDisable' = 1 }
+    $target = [ordered]@{ 'Sco Support Type' = $InBandValue; 'HfpOffloadDisable' = 1 }
 } elseif ($saved) {
     $target = [ordered]@{}
     foreach ($name in $maximum.Keys) { $target[$name] = Original $saved $name }
