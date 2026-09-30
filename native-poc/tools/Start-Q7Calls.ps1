@@ -12,7 +12,7 @@ param([Parameter(Mandatory)][string]$Phone, [Parameter(Mandatory)][string]$Heads
 $ErrorActionPreference = 'Stop'
 $tool = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\q7-winstack.exe'
 if (-not (Test-Path -LiteralPath $tool)) { throw "Missing $tool. Run ..\winstack\Register-WinStack.ps1 first." }
-function Say([string]$text) { Write-Host "$(Get-Date -Format HH:mm:ss)  $text" }
+function Say([string]$text) { Write-Host "$(Get-Date -Format HH:mm:ss.fff)  $text" }
 
 if ($Shortcut) {
     $link = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Q7 calls.lnk'
@@ -24,26 +24,36 @@ if ($Shortcut) {
     Say "Shortcut: $link"
 }
 
+# Two windows would each start a router on the same call.
+$single = New-Object Threading.Mutex($false, 'Local\Q7Calls')
+if (-not $single.WaitOne(0)) { Say 'Already running in another window; closing this one.'; Start-Sleep -Seconds 5; exit 1 }
 & (Join-Path $PSScriptRoot 'Set-HeadsetHandsFree.ps1') -Address $Headset -State Off
 & $tool connect $Phone | Out-Null
 Say 'Ready. Calls on the Q7 will play in the headset. Close this window to stop.'
 
 $route = $null
+$first = $false
 try {
     while ($true) {
         # Waiting only: transfer exits 0 once a call's audio is on the PC. It is NOT repeated during a
         # call (each run cut the call audio for ~1 s); route --follow keeps the call on the PC and
         # exits when the call ends.
-        & $tool transfer $Phone | Out-Null
+        $said = & $tool transfer $Phone
+        # Timing log: the first poll that sees a call (ringing, dialing...), then the move.
+        # Windows keeps an ended call listed for a while: status 0 (lost) and 5 (ended) are not new calls.
+        $seen = $said | Select-String -Pattern 'Call: status [1-4]\b' | Select-Object -First 1
+        if ($seen -and -not $first) { $first = $true; Say "Call seen ($($seen.Matches[0].Value); 1 incoming, 2 dialing, 3 talking, 4 held)" }
         if ($LASTEXITCODE -eq 0) {
-            Say 'Call on the PC: routing to the headset'
+            $first = $false
+            Say "Call on the PC ($(($said | Select-String 'moved|Already') -replace '^\[TRANSFER\] ', '')): routing to the headset"
             $route = Start-Process -FilePath $tool -ArgumentList 'route', '--phone', $Phone, '--headset', $Headset, '--stereo', '--follow' `
                                   -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $env:TEMP 'q7-route.log')
             $route.WaitForExit()
             $route = $null
             Say 'Call ended. Waiting for the next one.'
+            Get-Content (Join-Path $env:TEMP 'q7-route.log') | Select-String '^\[(TIME|CALL)\]|started' | ForEach-Object { Write-Host "            $($_.Line)" }
         }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Milliseconds 500 # transfer itself takes ~0.3 s, so a new call is seen within ~1 s
     }
 } finally {
     if ($route -and -not $route.HasExited) { Stop-Process -Id $route.Id -Force }

@@ -500,10 +500,11 @@ PhoneLine find_line(const PhoneLineTransportDevice& transport, const char* tag) 
     return nullptr;
 }
 
-enum class CallAudio { None, OnPc, Moved, Refused };
+enum class CallAudio { None, OnPc, OnPhone, Moved, Refused };
 // Moves the line's talking call to the PC (like upstream phone_transport.cpp TransferActiveCall).
 // Never dials, answers or touches calls of another phone. verbose: print the call's state.
-CallAudio move_call(const PhoneLine& line, const char* tag, bool verbose) {
+// move = false only reports OnPhone.
+CallAudio move_call(const PhoneLine& line, const char* tag, bool verbose, bool move = true) {
     const auto result = wait(line.GetAllActivePhoneCallsAsync());
     if (result.OperationStatus() != PhoneLineOperationStatus::Succeeded) { printf("%s Cannot list calls (status %d)\n", tag, int(result.OperationStatus())); return CallAudio::None; }
     for (const auto& call : result.AllActivePhoneCalls()) {
@@ -511,6 +512,7 @@ CallAudio move_call(const PhoneLine& line, const char* tag, bool verbose) {
         // Dialing too: Windows can miss the Q7's "answered" update and keep an outgoing call at Dialing.
         if (call.Status() != PhoneCallStatus::Talking && call.Status() != PhoneCallStatus::Dialing) continue;
         if (call.AudioDevice() == PhoneCallAudioDevice::LocalDevice) return CallAudio::OnPc;
+        if (!move) return CallAudio::OnPhone;
         const auto changed = wait(call.ChangeAudioDeviceAsync(PhoneCallAudioDevice::LocalDevice));
         if (changed != PhoneCallOperationStatus::Succeeded) printf("%s ChangeAudioDeviceAsync refused (%d)\n", tag, int(changed));
         return changed == PhoneCallOperationStatus::Succeeded ? CallAudio::Moved : CallAudio::Refused;
@@ -560,14 +562,24 @@ struct Stream {
     AudioRing* ring = nullptr; // captures push, renders pull
     std::atomic<uint64_t> frames{0};
     std::atomic<int> peak{0};
+    std::atomic<bool> heard{false}; // first non-silent packet already logged
     std::atomic<bool> running{false};
     std::atomic<HRESULT> error{S_OK};
     std::thread worker;
 };
 
+// Wall-clock time with milliseconds, to line the log up with Start-Q7Calls.ps1's lines.
+std::string stamp() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char text[16];
+    snprintf(text, sizeof text, "%02u:%02u:%02u.%03u", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    return text;
+}
 void note_audio(Stream& s, const int16_t* pcm, UINT32 frames) {
     int peak = 0;
     for (UINT32 i = 0; i < frames; ++i) peak = std::max(peak, std::abs(int(pcm[i])));
+    if (peak && !s.heard.exchange(true)) printf("[TIME] %s %s: first sound\n", stamp().c_str(), s.label);
     for (int seen = s.peak; peak > seen && !s.peak.compare_exchange_weak(seen, peak);) {}
     s.frames += frames;
 }
@@ -614,7 +626,7 @@ void stream_once(Stream& s, HANDLE stop, Failure& last) {
     unsigned mix_rate = 0;
     WAVEFORMATEX* mix = nullptr;
     if (SUCCEEDED(client->GetMixFormat(&mix))) { mix_rate = mix->nSamplesPerSec; CoTaskMemFree(mix); }
-    printf("[ROUTE] %s started (endpoint runs at %u Hz, converted to 8 kHz)\n", s.label, mix_rate);
+    printf("[ROUTE] %s %s started (endpoint runs at %u Hz, converted to 8 kHz)\n", stamp().c_str(), s.label, mix_rate);
     last = {S_OK, ""};
     s.error = S_OK;
     s.running = true;
@@ -825,9 +837,10 @@ int route(int argc, wchar_t** argv) {
         streams[i].ring = rings[i];
         streams[i].worker = std::thread(stream_worker, std::ref(streams[i]), stop);
     }
-    printf("[ROUTE] Routing call audio. Ctrl+C stops.\n");
+    printf("[ROUTE] %s Routing call audio. Ctrl+C stops.\n", stamp().c_str());
     uint64_t last[4] = {};
     int streak = 0, longest = 0, idle = 0;
+    bool claimed = false; // Windows' "audio on the phone" already logged
     bool announced = false;
     for (unsigned long second = 1; WaitForSingleObject(stop, 1000) == WAIT_TIMEOUT; ++second) {
         std::array<Tick, 4> ticks;
@@ -850,8 +863,14 @@ int route(int argc, wchar_t** argv) {
         }
         if (seconds && second >= seconds) break;
         if (line) {
-            const CallAudio call = move_call(line, "[CALL]", false);
-            if (call == CallAudio::Moved) printf("[CALL] %lus: the call audio was on the phone; moved it back to the PC\n", second);
+            // Windows reported the audio "on the phone" every ~5 s while the phone's sound kept
+            // flowing (2026-09-30), and each needless move cut ~0.1 s. So move only when the
+            // phone's sound really stopped: under a quarter of a second's frames in the last second.
+            const bool starving = ticks[0].frames < kRate / 4;
+            const CallAudio call = move_call(line, "[CALL]", false, starving);
+            if (call == CallAudio::OnPhone && !claimed) printf("[CALL] %s Windows says the audio is on the phone while it still flows here; left alone\n", stamp().c_str());
+            claimed = call == CallAudio::OnPhone;
+            if (call == CallAudio::Moved) printf("[CALL] %s the call audio was on the phone; moved it back to the PC\n", stamp().c_str());
             idle = call == CallAudio::None ? idle + 1 : 0;
             if (idle >= 3) { printf("[CALL] No call for 3 s: stopping\n"); break; }
         }

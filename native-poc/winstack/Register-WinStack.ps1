@@ -6,11 +6,21 @@
 param([switch]$Unregister)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-Get-AppxPackage -Name 'Q7Bridge.WinStack' | Remove-AppxPackage
-if ($Unregister) { Write-Output '[PKG] Removed'; return }
 $exe = Join-Path $repo 'build\winstack\Release\q7_winstack.exe'
-if (-not (Test-Path -LiteralPath $exe)) { throw "Missing $exe. Run Build-Q7.ps1 first." }
 $layout = Join-Path $repo 'build\winstack-pkg'
+$manifest = Join-Path $PSScriptRoot 'AppxManifest.xml'
+$registered = Get-AppxPackage -Name 'Q7Bridge.WinStack'
+# Same manifest: only swap the exe in the registered folder. Re-registering drops the phone's call
+# transport registration and makes Windows ask for access again on the next call.
+if (-not $Unregister -and $registered -and (Test-Path -LiteralPath $exe) -and
+    (Get-FileHash $manifest).Hash -eq (Get-FileHash (Join-Path $layout 'AppxManifest.xml') -ErrorAction SilentlyContinue).Hash) {
+    Copy-Item -LiteralPath $exe -Destination $layout -Force # fails while q7-winstack runs: close it first
+    Write-Output '[PKG] Updated the exe in place (registration and Windows permissions kept)'
+    return
+}
+$registered | Remove-AppxPackage
+if ($Unregister) { Write-Output '[PKG] Removed'; return }
+if (-not (Test-Path -LiteralPath $exe)) { throw "Missing $exe. Run Build-Q7.ps1 first." }
 New-Item -ItemType Directory -Force $layout | Out-Null
 Copy-Item -LiteralPath $exe, (Join-Path $PSScriptRoot 'AppxManifest.xml') -Destination $layout -Force
 # ponytail: 1x1 placeholder logo; the package is never shown in Start (AppListEntry="none").
