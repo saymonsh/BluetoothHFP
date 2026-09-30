@@ -7,8 +7,12 @@
 // The same two streams feed the local call-audio pipe served by ../q7/call_tap.cpp.
 //   q7_winstack list
 //   q7_winstack connect <phone address> | disconnect <phone address>
-//   q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect]
+//   q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect] [--stereo]
 //   q7_winstack selftest
+// --stereo fits the laptop's one call-audio link: the headset plays the call as stereo
+// headphones and your voice comes from the PC's default microphone instead of the headset's.
+// It needs the headset's hands-free service off (../tools/Set-HeadsetHandsFree.ps1 -State Off);
+// otherwise Windows sends the moved call to the headset's hands-free link and it bounces back.
 // route exits 0 once the two-link verdict was reached, 3 if it never was, 2 if it cannot start.
 #include <windows.h>
 #include <cfgmgr32.h>
@@ -158,10 +162,28 @@ const Endpoint* pick_endpoint(const std::vector<Endpoint>& endpoints, const GUID
     }
     return tie ? nullptr : best;
 }
+// The headset's one stereo (music) output that Windows still has; null when none or several.
+const Endpoint* pick_stereo(const std::vector<Endpoint>& endpoints, const GUID& container) {
+    const Endpoint* best = nullptr;
+    int count = 0;
+    for (const auto& e : endpoints)
+        if (!e.capture && has_container(container) && e.container == container && e.form != Headset && e.form != Handset &&
+            e.state != DEVICE_STATE_NOTPRESENT && e.state != DEVICE_STATE_DISABLED) { best = &e; ++count; }
+    return count == 1 ? best : nullptr;
+}
 // Route order: phone-in feeds headset-out, headset-in feeds phone-out.
-std::array<const Endpoint*, 4> pick_streams(const std::vector<Endpoint>& endpoints, const BtDevice& phone, const BtDevice& headset) {
-    return {pick_endpoint(endpoints, phone.container, true), pick_endpoint(endpoints, headset.container, false),
-            pick_endpoint(endpoints, headset.container, true), pick_endpoint(endpoints, phone.container, false)};
+// mic (--stereo): the headset stays on its stereo link and the voice comes from this PC
+// microphone, so only the phone holds a call-audio link. Null mic = the headset's hands-free pair.
+// A mic inside the phone or headset is refused: it would open a second call-audio link.
+std::array<const Endpoint*, 4> pick_streams(const std::vector<Endpoint>& endpoints, const BtDevice& phone, const BtDevice& headset,
+                                            const std::wstring* mic = nullptr) {
+    const Endpoint* voice = nullptr;
+    if (mic)
+        for (const auto& e : endpoints)
+            if (e.capture && _wcsicmp(e.id.c_str(), mic->c_str()) == 0 && e.container != phone.container && e.container != headset.container) voice = &e;
+    return {pick_endpoint(endpoints, phone.container, true),
+            mic ? pick_stereo(endpoints, headset.container) : pick_endpoint(endpoints, headset.container, false),
+            mic ? voice : pick_endpoint(endpoints, headset.container, true), pick_endpoint(endpoints, phone.container, false)};
 }
 // Seconds in a row during which all four streams ran, moved frames and carried sound.
 int next_streak(int streak, const std::array<Tick, 4>& ticks) {
@@ -485,7 +507,8 @@ int transfer(const std::wstring& text) {
         if (result.OperationStatus() != PhoneLineOperationStatus::Succeeded) { printf("%s Cannot list calls (status %d)\n", tag, int(result.OperationStatus())); return 1; }
         for (const auto& call : result.AllActivePhoneCalls()) {
             printf("%s Call: status %d, audio on %s\n", tag, int(call.Status()), call.AudioDevice() == PhoneCallAudioDevice::LocalDevice ? "PC" : "phone");
-            if (call.Status() != PhoneCallStatus::Talking) continue;
+            // Dialing too: Windows can miss the Q7's "answered" update and keep an outgoing call at Dialing.
+            if (call.Status() != PhoneCallStatus::Talking && call.Status() != PhoneCallStatus::Dialing) continue;
             if (call.AudioDevice() == PhoneCallAudioDevice::LocalDevice) { printf("%s Already on the PC\n", tag); return 0; }
             const auto changed = wait(call.ChangeAudioDeviceAsync(PhoneCallAudioDevice::LocalDevice));
             printf("%s ChangeAudioDeviceAsync: %s (%d)\n", tag, changed == PhoneCallOperationStatus::Succeeded ? "moved to the PC" : "refused", int(changed));
@@ -659,18 +682,21 @@ void usage() {
            "  q7_winstack connect <phone address>     ask Windows for this phone's call transport, step by step\n"
            "  q7_winstack transfer <phone address>    move the talking call to the PC\n"
            "  q7_winstack disconnect <phone address>  undo this tool's call transport registration\n"
-           "  q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect]\n"
+           "  q7_winstack route [--phone <address|name>] [--headset <address|name>] [--seconds N] [--connect] [--stereo]\n"
            "                                          --connect: hold the phone's call transport connected while routing\n"
+           "                                          --stereo: headset as stereo headphones, your voice from the PC's default mic\n"
+           "                                                    (one call-audio link in total: the phone's)\n"
            "  q7_winstack selftest\n");
 }
 
 int route(int argc, wchar_t** argv) {
     std::wstring phone_wanted, headset_wanted;
     unsigned long seconds = 0;
-    bool connect_first = false;
+    bool connect_first = false, stereo = false;
     for (int i = 0; i < argc; ++i) {
         const std::wstring flag = argv[i];
         if (flag == L"--connect") { connect_first = true; continue; }
+        if (flag == L"--stereo") { stereo = true; continue; }
         if (i + 1 >= argc) { usage(); return 2; }
         const wchar_t* value = argv[++i];
         if (flag == L"--phone") phone_wanted = value;
@@ -724,11 +750,20 @@ int route(int argc, wchar_t** argv) {
         // endpoints later than that, run route again (they exist by then).
         endpoints = audio_endpoints();
     }
-    const auto picks = pick_streams(endpoints, *phone, *headset);
+    const auto enumerator = create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator)); // default mic; endpoint states for the status line
+    std::wstring mic;
+    if (stereo) {
+        com_ptr<IMMDevice> device;
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, device.put())) && SUCCEEDED(device->GetId(&id))) { mic = id; CoTaskMemFree(id); }
+    }
+    const auto picks = pick_streams(endpoints, *phone, *headset, stereo ? &mic : nullptr);
     if (std::find(picks.begin(), picks.end(), nullptr) != picks.end()) {
         for (size_t i = 0; i < picks.size(); ++i)
-            if (!picks[i]) printf("[ROUTE] No single clear %s endpoint (none, or several equally likely). "
-                                  "Connect the device so its current endpoints are active, then run again.\n", kLabels[i]);
+            if (!picks[i] && stereo && i == 2) printf("[ROUTE] The default microphone is missing or belongs to the phone or headset. "
+                                                      "Set the PC's built-in microphone as default (Settings > Sound > Input), then run again.\n");
+            else if (!picks[i]) printf("[ROUTE] No single clear %s endpoint (none, or several equally likely). "
+                                       "Connect the device so its current endpoints are active, then run again.\n", kLabels[i]);
         for (const BtDevice* d : {phone, headset}) {
             printf("Endpoints of %s (%s):\n", u8(d->name).c_str(), pretty(d->address).c_str());
             for (const auto& e : endpoints) if (has_container(d->container) && e.container == d->container) print_endpoint(e, "");
@@ -742,7 +777,6 @@ int route(int argc, wchar_t** argv) {
     for (size_t i = 0; i < picks.size(); ++i)
         printf("[ROUTE] %-11s %s [%s]\n", kLabels[i], u8(picks[i]->name).c_str(), state_name(picks[i]->state));
 
-    const auto enumerator = create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator)); // endpoint states for the status line
     // Left open on purpose: the console handler may still use it, and the process ends soon after.
     const HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!stop) { printf("[ROUTE] Cannot create the stop event\n"); release(); return 1; }
@@ -781,7 +815,10 @@ int route(int argc, wchar_t** argv) {
                stream_status(streams[0], enumerator.get()).c_str(), stream_status(streams[1], enumerator.get()).c_str(),
                stream_status(streams[2], enumerator.get()).c_str(), stream_status(streams[3], enumerator.get()).c_str(),
                std::min(streak, kVerdictSeconds), kVerdictSeconds);
-        if (streak >= kVerdictSeconds && !announced) { announced = true; printf("[VERDICT] Two call-audio links active at once\n"); }
+        if (streak >= kVerdictSeconds && !announced) {
+            announced = true;
+            printf(stereo ? "[VERDICT] Call audio flows both ways (headset stereo + PC mic)\n" : "[VERDICT] Two call-audio links active at once\n");
+        }
         if (seconds && second >= seconds) break;
     }
     SetEvent(stop);
@@ -840,6 +877,14 @@ int selftest() {
     EXPECT(!pick_endpoint(endpoints, headset_box, false));
     EXPECT(!pick_endpoint(endpoints, GUID{}, true)); // a device without a container owns nothing
     // Hands-free still unplugged while the stereo endpoint is active: the hands-free one wins.
+    // --stereo: the headset's stereo output and the PC mic; a mic of the phone or headset is refused.
+    if (phone && headset) {
+        const std::wstring built_in = L"built-in-mic", headset_mic = L"h-in";
+        endpoints.push_back({built_in, L"PC mic", true, DEVICE_STATE_ACTIVE, Microphone, machine});
+        const auto picks = pick_streams(endpoints, *phone, *headset, &built_in);
+        EXPECT(picks[1] && picks[1]->id == L"h-stereo" && picks[2] && picks[2]->id == built_in);
+        EXPECT(!pick_streams(endpoints, *phone, *headset, &headset_mic)[2]);
+    }
     const GUID late_box{4};
     const std::vector<Endpoint> late = {{L"late-stereo", L"stereo", false, DEVICE_STATE_ACTIVE, Headphones, late_box},
                                         {L"late-hf", L"hands-free", false, DEVICE_STATE_UNPLUGGED, Headset, late_box}};
